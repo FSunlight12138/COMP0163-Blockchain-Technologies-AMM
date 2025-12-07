@@ -1,0 +1,215 @@
+// test/AMMPair.test.js
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+
+describe("AMMPair", function () {
+  let owner, user1;
+  let token0, token1, pair;
+
+  beforeEach(async function () {
+    [owner, user1] = await ethers.getSigners();
+
+    const ERC20 = await ethers.getContractFactory("MinimalERC20");
+    const initialSupply = ethers.parseEther("1000000");
+
+    // 部署两种测试代币
+    token0 = await ERC20.deploy("TokenA", "TKA", 18, initialSupply);
+    token1 = await ERC20.deploy("TokenB", "TKB", 18, initialSupply);
+    await token0.waitForDeployment();
+    await token1.waitForDeployment();
+
+    // 部署 AMMPair
+    const Pair = await ethers.getContractFactory("AMMPair");
+    pair = await Pair.deploy(
+      await token0.getAddress(),
+      await token1.getAddress()
+    );
+    await pair.waitForDeployment();
+
+    const pairAddress = await pair.getAddress();
+
+    // 给 pair 授权，让它能从 owner 账户拉走代币 (addLiquidity 内部 safeTransferFrom)
+    await token0.connect(owner).approve(pairAddress, initialSupply);
+    await token1.connect(owner).approve(pairAddress, initialSupply);
+  });
+
+  it("构造函数应正确初始化 token0 / token1 / LP 元数据 / 储备", async function () {
+    const token0Addr = await token0.getAddress();
+    const token1Addr = await token1.getAddress();
+
+    expect(await pair.token0()).to.equal(token0Addr);
+    expect(await pair.token1()).to.equal(token1Addr);
+
+    const [reserve0, reserve1] = await pair.getReserves();
+    expect(reserve0).to.equal(0n);
+    expect(reserve1).to.equal(0n);
+
+    // LP 名称: LP-<symbol0>-<symbol1>
+    expect(await pair.name()).to.equal("LP-TKA-TKB");
+    expect(await pair.symbol()).to.equal("LP-TKA-TKB");
+    expect(await pair.decimals()).to.equal(18);
+  });
+
+  it("addLiquidity 后应更新储备并铸造 LP，锁定 MINIMUM_LIQUIDITY", async function () {
+    const amount0 = ethers.parseEther("1000");
+    const amount1 = ethers.parseEther("1000");
+
+    const tx = await pair.connect(owner).addLiquidity(amount0, amount1);
+    await tx.wait();
+
+    const [reserve0, reserve1] = await pair.getReserves();
+    expect(reserve0).to.equal(amount0);
+    expect(reserve1).to.equal(amount1);
+
+    // owner 拿到的 LP
+    const lpBalance = await pair.balanceOf(owner.address);
+    expect(lpBalance).to.be.gt(0n);
+
+    // MINIMUM_LIQUIDITY 被铸造到 address(0)，永久锁定
+    const minLiquidity = await pair.MINIMUM_LIQUIDITY();
+    const zeroAddress = "0x0000000000000000000000000000000000000000";
+    const locked = await pair.balanceOf(zeroAddress);
+    expect(locked).to.equal(minLiquidity);
+  });
+
+  it("quoteAddLiquidity / quoteSwapExactIn 应给出合理的预估值", async function () {
+    const amount0 = ethers.parseEther("5000");
+    const amount1 = ethers.parseEther("10000");
+
+    // 先加一池子流动性
+    await (await pair.addLiquidity(amount0, amount1)).wait();
+
+    const token0Addr = await token0.getAddress();
+    const token1Addr = await token1.getAddress();
+
+    // 给定 token0 的数量，quoteAddLiquidity 返回需要的 token1 数量
+    const quoteForToken0 = await pair.quoteAddLiquidity(
+      token0Addr,
+      ethers.parseEther("1")
+    );
+    // 因为初始比例是 1 : 2，所以这里应该接近 2 （会有整数除法误差）
+    expect(quoteForToken0).to.equal(ethers.parseEther("2"));
+
+    // quoteSwapExactIn：输入 token0，estimate 能换多少 token1
+    const amountIn = ethers.parseEther("10");
+    const quotedOut = await pair.quoteSwapExactIn(token0Addr, amountIn);
+    expect(quotedOut).to.be.gt(0n);
+  });
+
+  it("在添加流动性后，swap 应按恒定乘积公式执行", async function () {
+    const initialA = ethers.parseEther("10000");
+    const initialB = ethers.parseEther("10000");
+
+    // owner 添加 initial 流动性
+    await (await pair.addLiquidity(initialA, initialB)).wait();
+
+    const token0Addr = await token0.getAddress();
+    const token1Addr = await token1.getAddress();
+    const pairAddress = await pair.getAddress();
+
+    // 准备 user1 的输入：一些 token0
+    const amountIn = ethers.parseEther("100");
+    await token0.transfer(user1.address, amountIn);
+
+    // 根据当前池子状态，计算理论能拿到多少 token1（含 0.3% 手续费）
+    const quotedOut = await pair.quoteSwapExactIn(token0Addr, amountIn);
+
+    // user1 先把 token0 转进 pair 合约，再调用 swap 取出 token1
+    await token0.connect(user1).transfer(pairAddress, amountIn);
+    await pair.connect(user1).swap(0, quotedOut, user1.address);
+
+    // user1 的 token1 余额应该等于 quotedOut
+    const user1BalanceB = await token1.balanceOf(user1.address);
+    expect(user1BalanceB).to.equal(quotedOut);
+
+    // 检查新的储备和恒定乘积关系（k' >= k）
+    const [newRes0, newRes1] = await pair.getReserves();
+    const k0 = initialA * initialB;
+    const k1 = newRes0 * newRes1;
+    expect(k1).to.be.gte(k0);
+  });
+
+  it("removeLiquidity 应按占比退还 token0 / token1", async function () {
+  const amount0 = ethers.parseEther("1000");
+  const amount1 = ethers.parseEther("2000");
+
+  // 1. 先添加一池子流动性
+  await (await pair.addLiquidity(amount0, amount1)).wait();
+
+  const lpBalance = await pair.balanceOf(owner.address);
+  expect(lpBalance).to.be.gt(0n);
+
+  const ownerToken0Before = await token0.balanceOf(owner.address);
+  const ownerToken1Before = await token1.balanceOf(owner.address);
+
+  // 2. 把 owner 手里的 LP 全部退掉
+  await (await pair.removeLiquidity(lpBalance, owner.address)).wait();
+
+  const ownerToken0After = await token0.balanceOf(owner.address);
+  const ownerToken1After = await token1.balanceOf(owner.address);
+
+  // 3. 确认 token0 / token1 余额都变多了
+  expect(ownerToken0After).to.be.gt(ownerToken0Before);
+  expect(ownerToken1After).to.be.gt(ownerToken1Before);
+
+  // 4. owner 的 LP 余额应变为 0
+  const lpBalanceAfter = await pair.balanceOf(owner.address);
+  expect(lpBalanceAfter).to.equal(0n);
+
+  // 5. 总供应量只剩下 MINIMUM_LIQUIDITY（锁在 0 地址）
+  const totalSupplyAfter = await pair.totalSupply();
+  const minLiquidity = await pair.MINIMUM_LIQUIDITY();
+
+  expect(totalSupplyAfter).to.equal(minLiquidity);
+
+  // （可选）如果你还想看储备，改成“非常小就行”，而不是必须等于 0：
+  const [reserve0After, reserve1After] = await pair.getReserves();
+  // 这里不再要求是 0，只要远小于最初的 1000 / 2000 即可
+  expect(reserve0After).to.be.lt(amount0 / 1000n); // 小于 1/1000
+  expect(reserve1After).to.be.lt(amount1 / 1000n);
+});
+
+
+  it("在没有流动性时，quoteSwapExactIn 应 revert NO_LIQUIDITY", async function () {
+    const token0Addr = await token0.getAddress();
+    await expect(
+      pair.quoteSwapExactIn(token0Addr, ethers.parseEther("1"))
+    ).to.be.revertedWith("NO_LIQUIDITY");
+  });
+
+  it("quoteAddLiquidity / quoteSwapExactIn 对错误 token 应 revert INVALID_TOKEN", async function () {
+    // 先加一点流动性，避免 NO_LIQUIDITY
+    await (await pair.addLiquidity(
+      ethers.parseEther("1"),
+      ethers.parseEther("1")
+    )).wait();
+
+    const fakeTokenAddr = user1.address; // 不是 token0 / token1
+
+    await expect(
+      pair.quoteAddLiquidity(fakeTokenAddr, 1n)
+    ).to.be.revertedWith("INVALID_TOKEN");
+
+    await expect(
+      pair.quoteSwapExactIn(fakeTokenAddr, 1n)
+    ).to.be.revertedWith("INVALID_TOKEN");
+  });
+
+  it("swap 同时指定 amount0Out 和 amount1Out 应 revert OUTPUT_BOTH", async function () {
+    // 有一些流动性
+    await (await pair.addLiquidity(
+      ethers.parseEther("10"),
+      ethers.parseEther("10")
+    )).wait();
+
+    await expect(
+      pair.swap(1n, 1n, user1.address)
+    ).to.be.revertedWith("OUTPUT_BOTH");
+  });
+
+  it("removeLiquidity(0) 应 revert ZERO_LIQUIDITY", async function () {
+    await expect(
+      pair.removeLiquidity(0n, owner.address)
+    ).to.be.revertedWith("ZERO_LIQUIDITY");
+  });
+});

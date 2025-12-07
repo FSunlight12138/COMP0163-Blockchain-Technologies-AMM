@@ -1,0 +1,132 @@
+// test/AMMFactory.test.js
+const { expect } = require("chai");
+const { ethers } = require("hardhat");
+const { anyValue } = require("@nomicfoundation/hardhat-chai-matchers/withArgs");
+
+describe("AMMFactory", function () {
+  let deployer, other;
+  let tokenA, tokenB;
+  let factory;
+
+  beforeEach(async function () {
+    [deployer, other] = await ethers.getSigners();
+
+    // 部署两种测试代币，后面用来创建交易对
+    const ERC20 = await ethers.getContractFactory("MinimalERC20");
+    const initialSupply = ethers.parseEther("1000000");
+
+    tokenA = await ERC20.deploy("TokenA", "TKA", 18, initialSupply);
+    tokenB = await ERC20.deploy("TokenB", "TKB", 18, initialSupply);
+    await tokenA.waitForDeployment();
+    await tokenB.waitForDeployment();
+
+    // 部署 Factory
+    const Factory = await ethers.getContractFactory("AMMFactory");
+    factory = await Factory.deploy();
+    await factory.waitForDeployment();
+  });
+
+  it("构造函数应把 feeToSetter 设为部署者", async function () {
+    expect(await factory.feeToSetter()).to.equal(deployer.address);
+    expect(await factory.feeTo()).to.equal(ethers.ZeroAddress);
+
+    const length = await factory.allPairsLength();
+    expect(length).to.equal(0n);
+  });
+
+  it("createPair 应创建新的 AMMPair 并在双向 mapping 中注册", async function () {
+    const tokenAAddr = await tokenA.getAddress();
+    const tokenBAddr = await tokenB.getAddress();
+
+    const token0 = tokenAAddr < tokenBAddr ? tokenAAddr : tokenBAddr;
+    const token1 = tokenAAddr < tokenBAddr ? tokenBAddr : tokenAAddr;
+
+    // 1. 调用 createPair，并检查事件
+    await expect(factory.createPair(tokenAAddr, tokenBAddr))
+      .to.emit(factory, "PairCreated")
+      .withArgs(token0, token1, anyValue, 1n);
+
+    // 2. 检查 getPair 映射（正反两种顺序都能查到同一个 pair）
+    const pairAB = await factory.getPair(tokenAAddr, tokenBAddr);
+    const pairBA = await factory.getPair(tokenBAddr, tokenAAddr);
+    expect(pairAB).to.not.equal(ethers.ZeroAddress);
+    expect(pairAB).to.equal(pairBA);
+
+    // 3. allPairsLength / allPairs 数组
+    const length = await factory.allPairsLength();
+    expect(length).to.equal(1n);
+
+    const firstPair = await factory.allPairs(0n);
+    expect(firstPair).to.equal(pairAB);
+
+    // 4. 检查新建 AMMPair 合约内部的 token0 / token1 是否按地址排序
+    const Pair = await ethers.getContractFactory("AMMPair");
+    const pair = Pair.attach(pairAB);
+    expect(await pair.token0()).to.equal(token0);
+    expect(await pair.token1()).to.equal(token1);
+  });
+
+  it("同一 token 传两遍应 revert IDENTICAL_ADDRESSES", async function () {
+    const tokenAAddr = await tokenA.getAddress();
+
+    await expect(
+      factory.createPair(tokenAAddr, tokenAAddr)
+    ).to.be.revertedWith("IDENTICAL_ADDRESSES");
+  });
+
+  it("token 为零地址应 revert ZERO_ADDRESS", async function () {
+    const tokenAAddr = await tokenA.getAddress();
+    const zero = ethers.ZeroAddress;
+
+    await expect(
+      factory.createPair(tokenAAddr, zero)
+    ).to.be.revertedWith("ZERO_ADDRESS");
+
+    await expect(
+      factory.createPair(zero, tokenAAddr)
+    ).to.be.revertedWith("ZERO_ADDRESS");
+  });
+
+  it("重复创建已存在的交易对应 revert PAIR_EXISTS", async function () {
+    const tokenAAddr = await tokenA.getAddress();
+    const tokenBAddr = await tokenB.getAddress();
+
+    await factory.createPair(tokenAAddr, tokenBAddr);
+
+    // 同样顺序
+    await expect(
+      factory.createPair(tokenAAddr, tokenBAddr)
+    ).to.be.revertedWith("PAIR_EXISTS");
+
+    // 反过来的顺序也不允许
+    await expect(
+      factory.createPair(tokenBAddr, tokenAAddr)
+    ).to.be.revertedWith("PAIR_EXISTS");
+  });
+
+  it("只有 feeToSetter 可以设置 feeTo", async function () {
+    // 部署者（当前 feeToSetter）可以设置 feeTo
+    await factory.setFeeTo(other.address);
+    expect(await factory.feeTo()).to.equal(other.address);
+
+    // 其他地址不能改
+    await expect(
+      factory.connect(other).setFeeTo(deployer.address)
+    ).to.be.revertedWith("FORBIDDEN");
+  });
+
+  it("只有 feeToSetter 可以更改 feeToSetter 本身", async function () {
+    // 1. 部署者把 feeToSetter 改成 other
+    await factory.setFeeToSetter(other.address);
+    expect(await factory.feeToSetter()).to.equal(other.address);
+
+    // 2. 旧的 setter（deployer）再想改就不行了
+    await expect(
+      factory.setFeeToSetter(deployer.address)
+    ).to.be.revertedWith("FORBIDDEN");
+
+    // 3. 新的 setter（other）可以改回来
+    await factory.connect(other).setFeeToSetter(deployer.address);
+    expect(await factory.feeToSetter()).to.equal(deployer.address);
+  });
+});

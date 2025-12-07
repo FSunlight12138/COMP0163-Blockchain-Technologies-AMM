@@ -1,0 +1,40 @@
+// scripts/Deploy.js
+// 部署两个 MinimalERC20 代币 + 一个 AMMPair 池子
+const { ethers } = require("hardhat");
+
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying contracts with:", deployer.address);
+
+  const initialSupply = ethers.parseEther("1000000"); // 1,000,000 * 10^18
+
+  // 1. 部署两种测试代币
+  const ERC20 = await ethers.getContractFactory("MinimalERC20");
+
+  const tokenA = await ERC20.deploy("TokenA", "TKA", 18, initialSupply);
+  await tokenA.waitForDeployment();
+  const tokenAAddress = await tokenA.getAddress();
+  console.log("TokenA deployed at:", tokenAAddress);
+
+  const tokenB = await ERC20.deploy("TokenB", "TKB", 18, initialSupply);
+  await tokenB.waitForDeployment();
+  const tokenBAddress = await tokenB.getAddress();
+  console.log("TokenB deployed at:", tokenBAddress);
+
+  // 2. 部署交易对 AMMPair
+  const Pair = await ethers.getContractFactory("AMMPair");
+  const pair = await Pair.deploy(tokenAAddress, tokenBAddress);
+  await pair.waitForDeployment();
+  const pairAddress = await pair.getAddress();
+  console.log("AMMPair deployed at:", pairAddress);
+
+  // 3. 给 pair 合约授权，方便后面直接用 deployer 调 addLiquidity
+  await (await tokenA.approve(pairAddress, initialSupply)).wait();
+  await (await tokenB.approve(pairAddress, initialSupply)).wait();
+  console.log("Approved AMMPair to spend deployer's tokens");
+}
+
+main().catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
