@@ -1,0 +1,160 @@
+import math
+from dataclasses import dataclass
+
+FEE_RATE = 0.003  # 固定 0.3%
+
+@dataclass
+class Result:
+    name: str
+    value_hold: float
+    value_lp: float
+    il_abs: float
+    il_pct: float
+    fee_income: float
+    value_lp_plus_fees: float
+    net_vs_hold_abs: float
+    net_vs_hold_pct: float
+
+def v2_position_at_price(amount0: float, amount1: float, P: float):
+    """
+    V2 full-range (xy=k) 100% pool position implied by initial x,y.
+    Price P is token1 per token0.
+    """
+    k = amount0 * amount1
+    x = math.sqrt(k / P)
+    y = math.sqrt(k * P)
+    return x, y
+
+def v3_amounts_from_L(S: float, Sa: float, Sb: float, L: float):
+    """
+    V3 position amounts (token0 x, token1 y) given liquidity L and range [Sa,Sb] in sqrt-price.
+    """
+    if S <= Sa:
+        x = L * (1.0 / Sa - 1.0 / Sb)
+        y = 0.0
+    elif S < Sb:
+        x = L * (1.0 / S - 1.0 / Sb)
+        y = L * (S - Sa)
+    else:
+        x = 0.0
+        y = L * (Sb - Sa)
+    return x, y
+
+def v3_liquidity_from_amounts(S: float, Sa: float, Sb: float, amount0: float, amount1: float):
+    """
+    Compute max liquidity L supported by (amount0, amount1) at current S with range [Sa,Sb].
+    Uses standard V3 formulas; if in-range take min(L0,L1).
+    """
+    if S <= Sa:
+        # all token0
+        L = amount0 / (1.0 / Sa - 1.0 / Sb)
+    elif S < Sb:
+        L0 = amount0 / (1.0 / S - 1.0 / Sb)
+        L1 = amount1 / (S - Sa)
+        L = min(L0, L1)
+    else:
+        # all token1
+        L = amount1 / (Sb - Sa)
+    return L
+
+def compute_il_and_fees_v2_vs_v3(
+    amount0: float,
+    amount1: float,
+    P0: float,
+    P1: float,
+    Pa: float,
+    Pb: float,
+    volume_token1_total: float,
+    frac_volume_in_v3_range: float,
+    share_v2: float = 1.0,
+    share_v3: float = 1.0,
+    fee_rate: float = FEE_RATE,
+):
+    """
+    Compare V2 vs V3:
+    - IL compares LP final value vs HODL value (both in token1 units).
+    - Fee income = fee_rate * volume_token1 * share
+      V2 uses total volume; V3 uses in-range volume only (simplified).
+    """
+
+    # ---------- Hold value at final price ----------
+    value_hold = amount0 * P1 + amount1  # in token1
+
+    # ---------- V2 LP value at final price ----------
+    x2, y2 = v2_position_at_price(amount0, amount1, P1)
+    value_v2_lp = (x2 * P1 + y2)  # 100% pool position value in token1
+    il_v2_abs = value_v2_lp - value_hold
+    il_v2_pct = il_v2_abs / value_hold if value_hold != 0 else float("nan")
+
+    fee_v2 = fee_rate * volume_token1_total * share_v2
+    v2_plus_fees = value_v2_lp + fee_v2
+
+    # ---------- V3: determine L from initial deposit at P0 ----------
+    S0 = math.sqrt(P0)
+    Sa = math.sqrt(Pa)
+    Sb = math.sqrt(Pb)
+    if not (Sa < Sb):
+        raise ValueError("Require Pa < Pb")
+    L = v3_liquidity_from_amounts(S0, Sa, Sb, amount0, amount1)
+
+    # actual amounts used for that L at P0 (rest is 'unused' outside position; assume you didn't deposit it)
+    x0_used, y0_used = v3_amounts_from_L(S0, Sa, Sb, L)
+
+    # IMPORTANT: if you want to assume你“把全部 amount0/amount1 都放进 position”，
+    # 那就需要 range/amounts匹配；否则会有 leftovers。
+    # 这里用“V3 position 实际占用”的 x0_used/y0_used 来计算 hold 基准更公平：
+    value_hold_v3 = x0_used * P1 + y0_used
+
+    # final amounts in position at P1
+    S1 = math.sqrt(P1)
+    x3, y3 = v3_amounts_from_L(S1, Sa, Sb, L)
+    value_v3_lp = x3 * P1 + y3
+
+    il_v3_abs = value_v3_lp - value_hold_v3
+    il_v3_pct = il_v3_abs / value_hold_v3 if value_hold_v3 != 0 else float("nan")
+
+    # fee: only when active; simplify by user-supplied fraction of volume inside your active range
+    volume_in_range = volume_token1_total * frac_volume_in_v3_range
+    fee_v3 = fee_rate * volume_in_range * share_v3
+    v3_plus_fees = value_v3_lp + fee_v3
+
+    # Pack results
+    r_v2 = Result(
+        name="V2 (full-range xy=k)",
+        value_hold=value_hold,
+        value_lp=value_v2_lp,
+        il_abs=il_v2_abs,
+        il_pct=il_v2_pct,
+        fee_income=fee_v2,
+        value_lp_plus_fees=v2_plus_fees,
+        net_vs_hold_abs=v2_plus_fees - value_hold,
+        net_vs_hold_pct=(v2_plus_fees - value_hold) / value_hold if value_hold else float("nan"),
+    )
+
+    r_v3 = Result(
+        name="V3 (concentrated range)",
+        value_hold=value_hold_v3,
+        value_lp=value_v3_lp,
+        il_abs=il_v3_abs,
+        il_pct=il_v3_pct,
+        fee_income=fee_v3,
+        value_lp_plus_fees=v3_plus_fees,
+        net_vs_hold_abs=v3_plus_fees - value_hold_v3,
+        net_vs_hold_pct=(v3_plus_fees - value_hold_v3) / value_hold_v3 if value_hold_v3 else float("nan"),
+    )
+
+    meta = {
+        "P0": P0,
+        "P1": P1,
+        "Pa": Pa,
+        "Pb": Pb,
+        "L_v3": L,
+        "v3_used_amount0": x0_used,
+        "v3_used_amount1": y0_used,
+        "volume_token1_total": volume_token1_total,
+        "volume_token1_in_range": volume_in_range,
+        "fee_rate": fee_rate,
+        "share_v2": share_v2,
+        "share_v3": share_v3,
+    }
+    return r_v2, r_v3, meta
