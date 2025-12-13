@@ -1,0 +1,121 @@
+import math
+from dataclasses import dataclass
+
+FEE_RATE = 0.003
+
+@dataclass
+class NetRow:
+    model: str
+    hold_value_token1: float
+    lp_value_token1: float
+    fee_income_token1: float
+    net_vs_hold_token1: float
+    net_vs_hold_pct: float
+
+def v2_lp_value(amount0, amount1, P1):
+    k = amount0 * amount1
+    x = math.sqrt(k / P1)
+    y = math.sqrt(k * P1)
+    return x * P1 + y
+
+def v3_liquidity_from_amounts(S, Sa, Sb, amount0, amount1):
+    if S <= Sa:
+        return amount0 / (1.0 / Sa - 1.0 / Sb)
+    elif S < Sb:
+        L0 = amount0 / (1.0 / S - 1.0 / Sb)
+        L1 = amount1 / (S - Sa)
+        return min(L0, L1)
+    else:
+        return amount1 / (Sb - Sa)
+
+def v3_amounts_from_L(S, Sa, Sb, L):
+    if S <= Sa:
+        return (L * (1.0 / Sa - 1.0 / Sb), 0.0)
+    elif S < Sb:
+        return (L * (1.0 / S - 1.0 / Sb), L * (S - Sa))
+    else:
+        return (0.0, L * (Sb - Sa))
+
+def compare_net_v2_vs_v3(
+    amount0, amount1,
+    P0, P1,
+    Pa, Pb,
+    volume_token1_total,
+    frac_volume_in_v3_range,
+    share_v2,
+    share_v3,
+    fee_rate=FEE_RATE
+):
+    # ---- V2 baseline hold ----
+    hold_v2 = amount0 * P1 + amount1
+
+    # ---- V2 LP value ----
+    lp_v2 = v2_lp_value(amount0, amount1, P1)
+
+    # ---- V2 fee ----
+    fee_v2 = fee_rate * volume_token1_total * share_v2
+
+    # ---- V2 net ----
+    net_v2 = lp_v2 + fee_v2 - hold_v2
+
+    # ---- V3: build position from initial amounts at P0 ----
+    S0 = math.sqrt(P0)
+    S1 = math.sqrt(P1)
+    Sa = math.sqrt(Pa)
+    Sb = math.sqrt(Pb)
+
+    L = v3_liquidity_from_amounts(S0, Sa, Sb, amount0, amount1)
+
+    # actual used amounts at entry (fair hold baseline for this position)
+    x0_used, y0_used = v3_amounts_from_L(S0, Sa, Sb, L)
+    hold_v3 = x0_used * P1 + y0_used
+
+    # final LP value
+    x1, y1 = v3_amounts_from_L(S1, Sa, Sb, L)
+    lp_v3 = x1 * P1 + y1
+
+    # V3 fee: only count volume while active (simplified)
+    volume_in_range = volume_token1_total * frac_volume_in_v3_range
+    fee_v3 = fee_rate * volume_in_range * share_v3
+
+    net_v3 = lp_v3 + fee_v3 - hold_v3
+
+    rows = [
+        NetRow("V2", hold_v2, lp_v2, fee_v2, net_v2, net_v2 / hold_v2),
+        NetRow("V3", hold_v3, lp_v3, fee_v3, net_v3, net_v3 / hold_v3),
+    ]
+
+    return rows, {
+        "L_v3": L,
+        "v3_used_amount0": x0_used,
+        "v3_used_amount1": y0_used,
+        "volume_in_range": volume_in_range,
+    }
+
+# ---------------- Example usage ----------------
+if __name__ == "__main__":
+    P0 = 2000.0
+    P1 = 2600.0
+    amount0 = 1.0
+    amount1 = 2000.0
+    Pa = 1800.0
+    Pb = 2400.0
+
+    volume_token1_total = 10_000_000.0
+    frac_volume_in_v3_range = 0.40
+    share_v2 = 0.01
+    share_v3 = 0.10
+
+    rows, meta = compare_net_v2_vs_v3(
+        amount0, amount1, P0, P1, Pa, Pb,
+        volume_token1_total, frac_volume_in_v3_range,
+        share_v2, share_v3
+    )
+
+    print("Meta:", meta)
+    for r in rows:
+        print(
+            f"{r.model} | Hold={r.hold_value_token1:,.4f} | LP={r.lp_value_token1:,.4f} | "
+            f"Fee={r.fee_income_token1:,.4f} | Net={r.net_vs_hold_token1:,.4f} "
+            f"({r.net_vs_hold_pct*100:,.4f}%)"
+        )
