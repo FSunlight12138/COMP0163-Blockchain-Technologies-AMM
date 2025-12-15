@@ -1,140 +1,95 @@
-mkdir uni-v3-fee-003 && cd uni-v3-fee-003
-npm init -y
-npm i -D hardhat typescript ts-node @types/node
-npm i @uniswap/v3-core @uniswap/v3-periphery @openzeppelin/contracts ethers
-npx hardhat init
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+const { ethers } = require("hardhat");
 
-import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-
-contract MockERC20 is ERC20 {
-    uint8 private _decimals;
-
-    constructor(string memory name_, string memory symbol_, uint8 decimals_) ERC20(name_, symbol_) {
-        _decimals = decimals_;
-    }
-
-    function decimals() public view override returns (uint8) {
-        return _decimals;
-    }
-
-    function mint(address to, uint256 amount) external {
-        _mint(to, amount);
-    }
-}
-import { ethers } from "hardhat";
-
-// 2^96
-const Q96 = BigInt(2) ** BigInt(96);
-
-// sqrtPriceX96 for price = 1:1  => sqrt(1) * 2^96
-const SQRT_PRICE_X96_1_1 = Q96;
-
-// fee for 0.03%
-const FEE_0_03 = 300; // 0.03%
+// 辅助函数：链接库文件
+const linkLibraries = ({ bytecode, linkReferences }, libraries) => {
+  Object.keys(linkReferences).forEach((fileName) => {
+    Object.keys(linkReferences[fileName]).forEach((contractName) => {
+      if (!libraries.hasOwnProperty(contractName)) {
+        throw new Error(`Missing library: ${contractName}`);
+      }
+      const address = libraries[contractName].replace("0x", "").toLowerCase();
+      const placeholders = linkReferences[fileName][contractName];
+      placeholders.forEach(({ start, length }) => {
+        const startByte = start * 2 + 2;
+        const lengthByte = length * 2;
+        bytecode =
+          bytecode.substring(0, startByte) +
+          address +
+          bytecode.substring(startByte + lengthByte);
+      });
+    });
+  });
+  return bytecode;
+};
 
 async function main() {
   const [deployer] = await ethers.getSigners();
-  console.log("deployer:", deployer.address);
+  console.log("Deploying contracts with the account:", deployer.address);
 
-  // ---- deploy tokens ----
-  const MockERC20 = await ethers.getContractFactory("MockERC20");
-  const tokenA = await MockERC20.deploy("TokenA", "TKA", 18);
-  const tokenB = await MockERC20.deploy("TokenB", "TKB", 18);
-  await tokenA.waitForDeployment();
-  await tokenB.waitForDeployment();
-
-  const tokenAAddr = await tokenA.getAddress();
-  const tokenBAddr = await tokenB.getAddress();
-  console.log("tokenA:", tokenAAddr);
-  console.log("tokenB:", tokenBAddr);
-
-  // ---- deploy Uniswap V3 Factory ----
+  // --- 1. 部署 Factory ---
   const Factory = await ethers.getContractFactory("UniswapV3Factory");
   const factory = await Factory.deploy();
-  await factory.waitForDeployment();
-  const factoryAddr = await factory.getAddress();
-  console.log("factory:", factoryAddr);
+  await factory.deployed();
+  console.log("UniswapV3Factory deployed to:", factory.address);
 
-  // ---- deploy WETH9 ----
-  const WETH9 = await ethers.getContractFactory("WETH9");
-  const weth = await WETH9.deploy();
-  await weth.waitForDeployment();
-  const wethAddr = await weth.getAddress();
-  console.log("weth:", wethAddr);
+  // --- 2. 关键步骤：开启 0.03% (300) 费率 ---
+  // 参数1: fee (300 = 0.03%)
+  // 参数2: tickSpacing (10 是比较合理的设置，配合低费率)
+  await factory.enableFeeAmount(300, 10); 
+  console.log(">>> Fee tier 0.03% (300) enabled on Factory!");
 
-  // ---- deploy NFT descriptor ----
-  // NonfungibleTokenPositionDescriptor needs (WETH9, nativeCurrencyLabelBytes32)
-  const PositionDescriptor = await ethers.getContractFactory("NonfungibleTokenPositionDescriptor");
-  const nativeLabel = ethers.encodeBytes32String("ETH"); // bytes32
-  const descriptor = await PositionDescriptor.deploy(wethAddr, nativeLabel);
-  await descriptor.waitForDeployment();
-  const descriptorAddr = await descriptor.getAddress();
-  console.log("descriptor:", descriptorAddr);
+  // --- 3. 部署 WETH (Mock) ---
+  const WETH9 = await ethers.getContractFactory("MockERC20"); // 这里简化用 Mock 代替
+  const weth9 = await WETH9.deploy("Wrapped Ether", "WETH");
+  await weth9.deployed();
+  console.log("WETH9 deployed to:", weth9.address);
 
-  // ---- deploy NonfungiblePositionManager ----
-  const NPM = await ethers.getContractFactory("NonfungiblePositionManager");
-  const npm = await NPM.deploy(factoryAddr, wethAddr, descriptorAddr);
-  await npm.waitForDeployment();
-  const npmAddr = await npm.getAddress();
-  console.log("positionManager:", npmAddr);
+  // --- 4. 部署 SwapRouter ---
+  const SwapRouter = await ethers.getContractFactory("SwapRouter");
+  const router = await SwapRouter.deploy(factory.address, weth9.address);
+  await router.deployed();
+  console.log("SwapRouter deployed to:", router.address);
 
-  // ---- enable new fee amount: 300 (0.03%) ----
-  // tickSpacing: choose 10 (commonly used for 0.05% tier). You can choose other reasonable spacing.
-  const txEnable = await factory.enableFeeAmount(FEE_0_03, 10);
-  await txEnable.wait();
-  console.log("enabled fee=300 tickSpacing=10");
+  // --- 5. 部署 PositionManager (需要处理库链接) ---
+  const NFTDescriptor = await ethers.getContractFactory("NFTDescriptor");
+  const nftDescriptor = await NFTDescriptor.deploy();
+  await nftDescriptor.deployed();
 
-  // ---- mint some tokens to deployer ----
-  const mintAmount = ethers.parseUnits("1000000", 18);
-  await (await tokenA.mint(deployer.address, mintAmount)).wait();
-  await (await tokenB.mint(deployer.address, mintAmount)).wait();
-
-  // ---- approvals to position manager ----
-  await (await tokenA.approve(npmAddr, mintAmount)).wait();
-  await (await tokenB.approve(npmAddr, mintAmount)).wait();
-
-  // ---- create + initialize pool (1:1) ----
-  // token ordering: NPM will sort internally in createAndInitializePoolIfNecessary
-  const txPool = await npm.createAndInitializePoolIfNecessary(
-    tokenAAddr,
-    tokenBAddr,
-    FEE_0_03,
-    SQRT_PRICE_X96_1_1
+  const PositionDescriptorArtifact = require("@uniswap/v3-periphery/artifacts/contracts/NonfungibleTokenPositionDescriptor.sol/NonfungibleTokenPositionDescriptor.json");
+  const linkedBytecode = linkLibraries(PositionDescriptorArtifact, {
+    NFTDescriptor: nftDescriptor.address,
+  });
+  
+  const PositionDescriptorFactory = await ethers.getContractFactory(
+    PositionDescriptorArtifact.abi,
+    linkedBytecode,
+    deployer
   );
-  await txPool.wait();
-  console.log("pool created & initialized");
+  // native currency label bytes32
+  const nativeLabel = ethers.utils.formatBytes32String("ETH");
+  const positionDescriptor = await PositionDescriptorFactory.deploy(weth9.address, nativeLabel);
+  await positionDescriptor.deployed();
 
-  // ---- fetch pool address ----
-  const poolAddr = await factory.getPool(tokenAAddr, tokenBAddr, FEE_0_03);
-  console.log("pool:", poolAddr);
+  const NonfungiblePositionManager = await ethers.getContractFactory("NonfungiblePositionManager");
+  const positionManager = await NonfungiblePositionManager.deploy(
+    factory.address,
+    weth9.address,
+    positionDescriptor.address
+  );
+  await positionManager.deployed();
+  console.log("NonfungiblePositionManager deployed to:", positionManager.address);
 
-  // ---- mint a position ----
-  // For simplicity choose a wide tick range.
-  // With tickSpacing=10, tickLower/tickUpper should be multiples of 10.
-  const params = {
-    token0: tokenAAddr < tokenBAddr ? tokenAAddr : tokenBAddr,
-    token1: tokenAAddr < tokenBAddr ? tokenBAddr : tokenAAddr,
-    fee: FEE_0_03,
-    tickLower: -60000, // multiple of 10
-    tickUpper:  60000, // multiple of 10
-    amount0Desired: ethers.parseUnits("1000", 18),
-    amount1Desired: ethers.parseUnits("1000", 18),
-    amount0Min: 0,
-    amount1Min: 0,
-    recipient: deployer.address,
-    deadline: Math.floor(Date.now() / 1000) + 60 * 10,
-  };
-
-  const txMint = await npm.mint(params);
-  const receipt = await txMint.wait();
-
-  // Mint emits IncreaseLiquidity + Transfer (ERC721). We just print success.
-  console.log("position minted. tx:", receipt?.hash);
+  return { factory, router, positionManager, weth9 };
 }
 
-main().catch((e) => {
-  console.error(e);
-  process.exit(1);
-});
+// 导出 main 函数供测试脚本调用，或者直接运行
+if (require.main === module) {
+  main()
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error(error);
+      process.exit(1);
+    });
+}
+
+module.exports = { deployV3System: main };
