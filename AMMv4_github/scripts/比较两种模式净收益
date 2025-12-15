@@ -1,7 +1,9 @@
 import math
 from dataclasses import dataclass
+from typing import List, Tuple, Dict, Any
 
 FEE_RATE = 0.003
+
 
 @dataclass
 class NetRow:
@@ -12,23 +14,42 @@ class NetRow:
     net_vs_hold_token1: float
     net_vs_hold_pct: float
 
-def v2_lp_value(amount0, amount1, P1):
+
+def v2_lp_value(amount0: float, amount1: float, P1: float) -> float:
+    """
+    V2 constant product: x*y=k.
+    Given initial amounts (amount0, amount1) as initial pool reserves for LP share 100%,
+    compute LP value at price P1 (token1 per token0).
+    """
     k = amount0 * amount1
     x = math.sqrt(k / P1)
     y = math.sqrt(k * P1)
     return x * P1 + y
 
-def v3_liquidity_from_amounts(S, Sa, Sb, amount0, amount1):
+
+def v3_liquidity_from_amounts(S: float, Sa: float, Sb: float, amount0: float, amount1: float) -> float:
+    """
+    Simplified V3 liquidity conversion using sqrt prices:
+      S = sqrt(P), Sa = sqrt(Pa), Sb = sqrt(Pb)
+    Returns L computed from provided amounts at current S.
+    """
     if S <= Sa:
+        # all in token0 region
         return amount0 / (1.0 / Sa - 1.0 / Sb)
     elif S < Sb:
         L0 = amount0 / (1.0 / S - 1.0 / Sb)
         L1 = amount1 / (S - Sa)
         return min(L0, L1)
     else:
+        # all in token1 region
         return amount1 / (Sb - Sa)
 
-def v3_amounts_from_L(S, Sa, Sb, L):
+
+def v3_amounts_from_L(S: float, Sa: float, Sb: float, L: float) -> Tuple[float, float]:
+    """
+    Given liquidity L and sqrt prices, compute amounts (amount0, amount1)
+    at current S.
+    """
     if S <= Sa:
         return (L * (1.0 / Sa - 1.0 / Sb), 0.0)
     elif S < Sb:
@@ -36,29 +57,43 @@ def v3_amounts_from_L(S, Sa, Sb, L):
     else:
         return (0.0, L * (Sb - Sa))
 
+
 def compare_net_v2_vs_v3(
-    amount0, amount1,
-    P0, P1,
-    Pa, Pb,
-    volume_token1_total,
-    frac_volume_in_v3_range,
-    share_v2,
-    share_v3,
-    fee_rate=FEE_RATE
-):
+    amount0: float,
+    amount1: float,
+    P0: float,
+    P1: float,
+    Pa: float,
+    Pb: float,
+    volume_token1_total: float,
+    frac_volume_in_v3_range: float,
+    share_v2: float,
+    share_v3: float,
+    fee_rate: float = FEE_RATE,
+) -> Tuple[List[NetRow], Dict[str, Any]]:
+    """
+    Compare V2 vs V3 net outcomes (token1-denominated) for a single-step model.
+
+    Important modeling notes (your original model):
+    - V2 "Hold" uses full initial (amount0, amount1).
+    - V3 "Hold" uses only the amounts actually used to create the position at P0
+      (x0_used, y0_used). Any unused capital is ignored in this simplified model.
+    - V3 fee uses volume_in_range = total_volume * frac_volume_in_v3_range.
+    """
+
     # ---- V2 baseline hold ----
     hold_v2 = amount0 * P1 + amount1
 
-    # ---- V2 LP value ----
+    # ---- V2 LP value (no fees) ----
     lp_v2 = v2_lp_value(amount0, amount1, P1)
 
     # ---- V2 fee ----
     fee_v2 = fee_rate * volume_token1_total * share_v2
 
-    # ---- V2 net ----
+    # ---- V2 net vs hold ----
     net_v2 = lp_v2 + fee_v2 - hold_v2
 
-    # ---- V3: build position from initial amounts at P0 ----
+    # ---- V3 position from initial amounts at P0 ----
     S0 = math.sqrt(P0)
     S1 = math.sqrt(P1)
     Sa = math.sqrt(Pa)
@@ -66,11 +101,11 @@ def compare_net_v2_vs_v3(
 
     L = v3_liquidity_from_amounts(S0, Sa, Sb, amount0, amount1)
 
-    # actual used amounts at entry (fair hold baseline for this position)
+    # actual used amounts at entry (baseline hold for this position)
     x0_used, y0_used = v3_amounts_from_L(S0, Sa, Sb, L)
     hold_v3 = x0_used * P1 + y0_used
 
-    # final LP value
+    # final LP value (no fees)
     x1, y1 = v3_amounts_from_L(S1, Sa, Sb, L)
     lp_v3 = x1 * P1 + y1
 
@@ -81,41 +116,152 @@ def compare_net_v2_vs_v3(
     net_v3 = lp_v3 + fee_v3 - hold_v3
 
     rows = [
-        NetRow("V2", hold_v2, lp_v2, fee_v2, net_v2, net_v2 / hold_v2),
-        NetRow("V3", hold_v3, lp_v3, fee_v3, net_v3, net_v3 / hold_v3),
+        NetRow("V2", hold_v2, lp_v2, fee_v2, net_v2, net_v2 / hold_v2 if hold_v2 != 0 else float("nan")),
+        NetRow("V3", hold_v3, lp_v3, fee_v3, net_v3, net_v3 / hold_v3 if hold_v3 != 0 else float("nan")),
     ]
 
-    return rows, {
+    # Extra diagnostics
+    in_range_end = (Sa < S1 < Sb)
+    end_region = "below" if S1 <= Sa else ("in-range" if S1 < Sb else "above")
+
+    meta = {
         "L_v3": L,
         "v3_used_amount0": x0_used,
         "v3_used_amount1": y0_used,
         "volume_in_range": volume_in_range,
+        "S0": S0,
+        "S1": S1,
+        "Sa": Sa,
+        "Sb": Sb,
+        "end_in_range": in_range_end,
+        "end_region": end_region,
     }
+    return rows, meta
 
-# ---------------- Example usage ----------------
+
+# ---------------- Rendering helpers ----------------
+
+def render_plain_table(rows_with_scen: List[Tuple[str, NetRow]], title: str, metas: Dict[str, Any]) -> None:
+    print(title)
+    print("=" * len(title))
+    header = ["Scenario", "Model", "Hold", "LP", "Fee", "Net vs Hold", "Net %"]
+    print("{:<26} {:<4} {:>12} {:>12} {:>10} {:>12} {:>8}".format(*header))
+    print("-" * 92)
+    for scen, r in rows_with_scen:
+        print(
+            "{:<26} {:<4} {:>12.2f} {:>12.2f} {:>10.2f} {:>12.2f} {:>7.2f}%".format(
+                scen,
+                r.model,
+                r.hold_value_token1,
+                r.lp_value_token1,
+                r.fee_income_token1,
+                r.net_vs_hold_token1,
+                r.net_vs_hold_pct * 100.0,
+            )
+        )
+    print("\nMeta per scenario:")
+    for scen, meta in metas.items():
+        print(f"- {scen}: end_region={meta['end_region']}, end_in_range={meta['end_in_range']}, "
+              f"v3_used0={meta['v3_used_amount0']:.4f}, v3_used1={meta['v3_used_amount1']:.4f}, "
+              f"volume_in_range={meta['volume_in_range']:.2f}")
+
+
+def render_rich_table(rows_with_scen: List[Tuple[str, NetRow]], title: str, metas: Dict[str, Any]) -> None:
+    from rich.console import Console
+    from rich.table import Table
+    from rich.text import Text
+
+    console = Console()
+    table = Table(title=title, header_style="bold")
+
+    table.add_column("Scenario", justify="left")
+    table.add_column("Model", justify="left", no_wrap=True)
+    table.add_column("Hold (token1)", justify="right")
+    table.add_column("LP (token1)", justify="right")
+    table.add_column("Fee (token1)", justify="right")
+    table.add_column("Net vs Hold", justify="right")
+    table.add_column("Net %", justify="right")
+
+    for scen, r in rows_with_scen:
+        net = r.net_vs_hold_token1
+        pct = r.net_vs_hold_pct * 100.0
+        net_style = "green" if net >= 0 else "red"
+        pct_style = "green" if pct >= 0 else "red"
+        table.add_row(
+            scen,
+            r.model,
+            f"{r.hold_value_token1:,.4f}",
+            f"{r.lp_value_token1:,.4f}",
+            f"{r.fee_income_token1:,.4f}",
+            Text(f"{net:,.4f}", style=net_style),
+            Text(f"{pct:,.4f}%", style=pct_style),
+        )
+
+    console.print(table)
+
+    console.print("\n[bold]Meta per scenario:[/bold]")
+    for scen, meta in metas.items():
+        console.print(
+            f"- {scen}: end_region=[cyan]{meta['end_region']}[/cyan], "
+            f"end_in_range={meta['end_in_range']}, "
+            f"v3_used0={meta['v3_used_amount0']:.6f}, v3_used1={meta['v3_used_amount1']:.6f}, "
+            f"volume_in_range={meta['volume_in_range']:.2f}"
+        )
+
+
+# ---------------- Main: build 5 scenarios table ----------------
+
 if __name__ == "__main__":
+    # Common parameters (edit here)
     P0 = 2000.0
-    P1 = 2600.0
     amount0 = 1.0
     amount1 = 2000.0
     Pa = 1800.0
     Pb = 2400.0
 
     volume_token1_total = 10_000_000.0
-    frac_volume_in_v3_range = 0.40
     share_v2 = 0.01
     share_v3 = 0.10
 
-    rows, meta = compare_net_v2_vs_v3(
-        amount0, amount1, P0, P1, Pa, Pb,
-        volume_token1_total, frac_volume_in_v3_range,
-        share_v2, share_v3
-    )
+    # 5 scenarios:
+    # - below range: P1 < Pa
+    # - in range: Pa < P1 < Pb
+    # - above range: P1 > Pb
+    # - cross up: ends above but some volume occurred in-range
+    # - cross down: ends below but some volume occurred in-range
+    scenarios = [
+        ("Below range (P1 < Pa)", 1700.0, 0.0),
+        ("In range (Pa < P1 < Pb)", 2100.0, 1.0),
+        ("Above range (P1 > Pb)", 2600.0, 0.0),
+        ("Cross up (in -> above)", 2600.0, 0.4),
+        ("Cross down (in -> below)", 1700.0, 0.4),
+    ]
 
-    print("Meta:", meta)
-    for r in rows:
-        print(
-            f"{r.model} | Hold={r.hold_value_token1:,.4f} | LP={r.lp_value_token1:,.4f} | "
-            f"Fee={r.fee_income_token1:,.4f} | Net={r.net_vs_hold_token1:,.4f} "
-            f"({r.net_vs_hold_pct*100:,.4f}%)"
+    rows_with_scen: List[Tuple[str, NetRow]] = []
+    metas: Dict[str, Any] = {}
+
+    for scen_name, P1, frac_in_range in scenarios:
+        rows, meta = compare_net_v2_vs_v3(
+            amount0=amount0,
+            amount1=amount1,
+            P0=P0,
+            P1=P1,
+            Pa=Pa,
+            Pb=Pb,
+            volume_token1_total=volume_token1_total,
+            frac_volume_in_v3_range=frac_in_range,
+            share_v2=share_v2,
+            share_v3=share_v3,
+            fee_rate=FEE_RATE,
         )
+        for r in rows:
+            rows_with_scen.append((scen_name, r))
+        metas[scen_name] = meta
+
+    title = "V2 vs V3 LP Net Results by Scenario (token1-denominated)"
+
+    # Try rich, fallback to plain
+    try:
+        render_rich_table(rows_with_scen, title, metas)
+    except Exception:
+        render_plain_table(rows_with_scen, title, metas)
