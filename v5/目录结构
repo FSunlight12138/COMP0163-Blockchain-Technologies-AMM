@@ -1,0 +1,11 @@
+v3-fixed-fee-hardhat/
+  package.json
+  tsconfig.json
+  hardhat.config.ts
+  contracts/
+    MockERC20.sol
+    V3FixedFeeManager.sol
+  scripts/
+    deploy.ts
+  test/
+    v3.fixedfee.test.ts
