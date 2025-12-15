@@ -1,0 +1,6 @@
+mkdir v3-fixed-fee-hardhat && cd v3-fixed-fee-hardhat
+# 把上述文件按路径创建好后：
+npm i
+npm run compile
+npm run test
+npm run deploy
