@@ -1,0 +1,65 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Factory.sol";
+import "@uniswap/v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
+import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+
+contract V3FixedFeeManager {
+    /// @dev 0.03% = 300
+    uint24 public constant FIXED_FEE = 300;
+
+    IUniswapV3Factory public immutable factory;
+    INonfungiblePositionManager public immutable positionManager;
+    ISwapRouter public immutable swapRouter;
+
+    constructor(address _factory, address _positionManager, address _swapRouter) {
+        require(_factory != address(0) && _positionManager != address(0) && _swapRouter != address(0), "zero");
+        factory = IUniswapV3Factory(_factory);
+        positionManager = INonfungiblePositionManager(_positionManager);
+        swapRouter = ISwapRouter(_swapRouter);
+    }
+
+    function getPool(address token0, address token1) public view returns (address) {
+        return factory.getPool(token0, token1, FIXED_FEE);
+    }
+
+    /// @notice 创建并初始化池（fee 固定 300）
+    function createAndInitializePoolIfNecessary(
+        address token0,
+        address token1,
+        uint160 sqrtPriceX96
+    ) external returns (address pool) {
+        pool = positionManager.createAndInitializePoolIfNecessary(token0, token1, FIXED_FEE, sqrtPriceX96);
+    }
+
+    /// @notice mint LP 仓位（NFT），fee 必须等于 300
+    function mintPosition(
+        INonfungiblePositionManager.MintParams calldata params
+    ) external payable returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1) {
+        require(params.fee == FIXED_FEE, "fee must be 0.03%");
+        return positionManager.mint(params);
+    }
+
+    /// @notice 单跳 exactInputSingle swap，fee 固定 300
+    function swapExactInputSingle(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn,
+        uint256 amountOutMinimum,
+        uint160 sqrtPriceLimitX96
+    ) external payable returns (uint256 amountOut) {
+        ISwapRouter.ExactInputSingleParams memory p = ISwapRouter.ExactInputSingleParams({
+            tokenIn: tokenIn,
+            tokenOut: tokenOut,
+            fee: FIXED_FEE,
+            recipient: msg.sender,
+            deadline: block.timestamp,
+            amountIn: amountIn,
+            amountOutMinimum: amountOutMinimum,
+            sqrtPriceLimitX96: sqrtPriceLimitX96
+        });
+
+        amountOut = swapRouter.exactInputSingle(p);
+    }
+}
