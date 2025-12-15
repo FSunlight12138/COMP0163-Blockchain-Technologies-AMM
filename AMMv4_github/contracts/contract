@@ -1,69 +1,95 @@
-// SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+const { ethers } = require("hardhat");
 
-import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Factory.sol";
-import "@uniswap/v3-core/contracts/interfaces/IUniswapV3Pool.sol";
+// 辅助函数：链接库文件
+const linkLibraries = ({ bytecode, linkReferences }, libraries) => {
+  Object.keys(linkReferences).forEach((fileName) => {
+    Object.keys(linkReferences[fileName]).forEach((contractName) => {
+      if (!libraries.hasOwnProperty(contractName)) {
+        throw new Error(`Missing library: ${contractName}`);
+      }
+      const address = libraries[contractName].replace("0x", "").toLowerCase();
+      const placeholders = linkReferences[fileName][contractName];
+      placeholders.forEach(({ start, length }) => {
+        const startByte = start * 2 + 2;
+        const lengthByte = length * 2;
+        bytecode =
+          bytecode.substring(0, startByte) +
+          address +
+          bytecode.substring(startByte + lengthByte);
+      });
+    });
+  });
+  return bytecode;
+};
 
-import "@uniswap/v3-periphery/contracts/interfaces/INonfungiblePositionManager.sol";
-import "@uniswap/v3-periphery/contracts/interfaces/ISwapRouter.sol";
+async function main() {
+  const [deployer] = await ethers.getSigners();
+  console.log("Deploying contracts with the account:", deployer.address);
 
-contract V3FixedFeeManager {
-    /// @dev 0.03% = 300 (Uniswap V3 fee units)
-    uint24 public constant FIXED_FEE = 300;
+  // --- 1. 部署 Factory ---
+  const Factory = await ethers.getContractFactory("UniswapV3Factory");
+  const factory = await Factory.deploy();
+  await factory.deployed();
+  console.log("UniswapV3Factory deployed to:", factory.address);
 
-    IUniswapV3Factory public immutable factory;
-    INonfungiblePositionManager public immutable positionManager;
-    ISwapRouter public immutable swapRouter;
+  // --- 2. 关键步骤：开启 0.03% (300) 费率 ---
+  // 参数1: fee (300 = 0.03%)
+  // 参数2: tickSpacing (10 是比较合理的设置，配合低费率)
+  await factory.enableFeeAmount(300, 10); 
+  console.log(">>> Fee tier 0.03% (300) enabled on Factory!");
 
-    constructor(address _factory, address _positionManager, address _swapRouter) {
-        require(_factory != address(0) && _positionManager != address(0) && _swapRouter != address(0), "zero");
-        factory = IUniswapV3Factory(_factory);
-        positionManager = INonfungiblePositionManager(_positionManager);
-        swapRouter = ISwapRouter(_swapRouter);
-    }
+  // --- 3. 部署 WETH (Mock) ---
+  const WETH9 = await ethers.getContractFactory("MockERC20"); // 这里简化用 Mock 代替
+  const weth9 = await WETH9.deploy("Wrapped Ether", "WETH");
+  await weth9.deployed();
+  console.log("WETH9 deployed to:", weth9.address);
 
-    function getPool(address token0, address token1) public view returns (address) {
-        return factory.getPool(token0, token1, FIXED_FEE);
-    }
+  // --- 4. 部署 SwapRouter ---
+  const SwapRouter = await ethers.getContractFactory("SwapRouter");
+  const router = await SwapRouter.deploy(factory.address, weth9.address);
+  await router.deployed();
+  console.log("SwapRouter deployed to:", router.address);
 
-    /// @notice 创建并初始化池（fee 固定为 300）
-    function createAndInitializePoolIfNecessary(
-        address token0,
-        address token1,
-        uint160 sqrtPriceX96
-    ) external returns (address pool) {
-        pool = positionManager.createAndInitializePoolIfNecessary(token0, token1, FIXED_FEE, sqrtPriceX96);
-    }
+  // --- 5. 部署 PositionManager (需要处理库链接) ---
+  const NFTDescriptor = await ethers.getContractFactory("NFTDescriptor");
+  const nftDescriptor = await NFTDescriptor.deploy();
+  await nftDescriptor.deployed();
 
-    /// @notice mint 一个 LP 仓位（NFT），fee 固定为 300
-    function mintPosition(
-        INonfungiblePositionManager.MintParams calldata params
-    ) external payable returns (uint256 tokenId, uint128 liquidity, uint256 amount0, uint256 amount1) {
-        require(params.fee == FIXED_FEE, "fee must be 0.03%");
-        // 直接转发给 positionManager；token 的 approve 需要用户对 positionManager 做
-        return positionManager.mint(params);
-    }
+  const PositionDescriptorArtifact = require("@uniswap/v3-periphery/artifacts/contracts/NonfungibleTokenPositionDescriptor.sol/NonfungibleTokenPositionDescriptor.json");
+  const linkedBytecode = linkLibraries(PositionDescriptorArtifact, {
+    NFTDescriptor: nftDescriptor.address,
+  });
+  
+  const PositionDescriptorFactory = await ethers.getContractFactory(
+    PositionDescriptorArtifact.abi,
+    linkedBytecode,
+    deployer
+  );
+  // native currency label bytes32
+  const nativeLabel = ethers.utils.formatBytes32String("ETH");
+  const positionDescriptor = await PositionDescriptorFactory.deploy(weth9.address, nativeLabel);
+  await positionDescriptor.deployed();
 
-    /// @notice 单跳 exactInputSingle swap，fee 固定为 300
-    function swapExactInputSingle(
-        address tokenIn,
-        address tokenOut,
-        uint256 amountIn,
-        uint256 amountOutMinimum,
-        uint160 sqrtPriceLimitX96
-    ) external payable returns (uint256 amountOut) {
-        // tokenIn 的 approve 需要用户对 swapRouter 做
-        ISwapRouter.ExactInputSingleParams memory p = ISwapRouter.ExactInputSingleParams({
-            tokenIn: tokenIn,
-            tokenOut: tokenOut,
-            fee: FIXED_FEE,
-            recipient: msg.sender,
-            deadline: block.timestamp,
-            amountIn: amountIn,
-            amountOutMinimum: amountOutMinimum,
-            sqrtPriceLimitX96: sqrtPriceLimitX96
-        });
+  const NonfungiblePositionManager = await ethers.getContractFactory("NonfungiblePositionManager");
+  const positionManager = await NonfungiblePositionManager.deploy(
+    factory.address,
+    weth9.address,
+    positionDescriptor.address
+  );
+  await positionManager.deployed();
+  console.log("NonfungiblePositionManager deployed to:", positionManager.address);
 
-        amountOut = swapRouter.exactInputSingle(p);
-    }
+  return { factory, router, positionManager, weth9 };
 }
+
+// 导出 main 函数供测试脚本调用，或者直接运行
+if (require.main === module) {
+  main()
+    .then(() => process.exit(0))
+    .catch((error) => {
+      console.error(error);
+      process.exit(1);
+    });
+}
+
+module.exports = { deployV3System: main };
